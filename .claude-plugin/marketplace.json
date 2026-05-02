@@ -1,0 +1,22 @@
+{
+  "name": "tsconfig-modern-strict",
+  "owner": {
+    "name": "kongyo2",
+    "email": ""
+  },
+  "metadata": {
+    "description": "tsconfigのセットアップ",
+    "version": "1.0.1"
+  },
+  "plugins": [
+    {
+      "name": "tsconfig-modern-strict",
+      "description": "tsconfigのセットアップ",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./tsconfig-modern-strict"
+      ]
+    }
+  ]
+}
