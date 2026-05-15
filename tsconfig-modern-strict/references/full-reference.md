@@ -1,334 +1,135 @@
-# TypeScript Configuration Reference (ESNext + Maximum Strict)
+# TypeScript Configuration Reference (prose: the "why")
 
-This document is an LLM-oriented reference for setting up `tsconfig.json` with
-modern defaults: `ESNext` targets, bundler-based module resolution, and the
-strictest type-checking options that are practical for real projects.
+SKILL.md は「何を」「どう」並べるかの運用書。本ファイルは **その背後の「なぜ」** に絞った prose の解説。テンプレや表は SKILL.md にあり、ここでは繰り返さない。SKILL.md から特定の話題を深掘りしたいときに、対応する節を読みに来る形を想定する。
 
-**Default policy**
-
-- Target the latest JavaScript syntax (`ESNext`).
-- Enable every strict flag unless there is a concrete reason not to.
-- Prefer `bundler` / `NodeNext` module resolution over the legacy `node` mode.
-- Treat the type checker as a linter (`noEmit: true`) and let bundlers / tsc
-  itself emit, depending on the use case.
+対象 TypeScript: 5.0 以降。それより古い版の挙動はカバーしない。
 
 ---
 
-## 1. Base Configuration
+## 目次
 
-Use this as the starting point for application code that is consumed by a
-bundler (Vite, webpack, Rspack, esbuild, Rolldown, etc.).
-
-```json
-{
-  "compilerOptions": {
-    /* Language and runtime */
-    "target": "esnext",
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "lib": ["esnext", "dom", "dom.iterable"],
-    "jsx": "react-jsx",
-
-    /* Emit */
-    "noEmit": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "resolveJsonModule": true,
-    "allowImportingTsExtensions": true,
-
-    /* Interop */
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
-
-    /* Strictness (max) */
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "allowUnreachableCode": false,
-    "allowUnusedLabels": false
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
-}
-```
-
-### Why each option
-
-| Option | Reason |
-| --- | --- |
-| `target: "esnext"` | Emit modern syntax; downleveling is the bundler's job. |
-| `module: "esnext"` | Preserve `import`/`export` so the bundler can tree-shake. |
-| `moduleResolution: "bundler"` | Matches how Vite / webpack actually resolve modules; allows extensionless imports. |
-| `lib` | Pin globals explicitly. Drop `dom` for Node-only code. |
-| `noEmit: true` | tsc only type-checks; the bundler handles emit. |
-| `isolatedModules: true` | Required when esbuild / SWC / Babel transpile per-file. |
-| `verbatimModuleSyntax: true` | Forces explicit `import type` / `export type`; output mirrors source. |
-| `allowImportingTsExtensions: true` | Permits `import x from "./foo.ts"`, useful with Vite, Deno, Bun. Pair with `noEmit: true`. |
-| `esModuleInterop: true` | Allows `import express from "express"` against CJS modules. |
-| `skipLibCheck: true` | Skips `.d.ts` checking inside `node_modules`. Massive speedup, near-zero downside. |
-| `strict: true` | Enables eight sub-flags (see §3). |
-| `noUncheckedIndexedAccess` | `arr[i]` and `obj[k]` become `T \| undefined`. Catches a huge class of bugs. |
-| `exactOptionalPropertyTypes` | `{ x?: number }` rejects `{ x: undefined }`; `?:` means "may be absent", not "may be undefined". |
-| `noImplicitOverride` | Subclass methods that override must say `override`. |
+- §1. Why ESNext + Maximum Strict（全体哲学）
+- §2. Flag-by-flag rationale（各 flag の「なぜ」）
+  - §2.1 `target` / `module` / `moduleResolution` のトリオが独立に決まらない理由
+  - §2.2 `strict: true` が括る 8 フラグの個別解説
+  - §2.3 `strict` に入らないが入れるべき追加フラグの個別解説
+  - §2.4 `verbatimModuleSyntax` / `isolatedModules` がなぜペアで効くか
+  - §2.5 `skipLibCheck` を切ってはいけない実務上の理由
+- §3. Library publishing in depth（`package.json` `exports` の詳細パターン）
+  - §3.1 conditional exports と `types` の評価順
+  - §3.2 subpath wildcards
+  - §3.3 dual-package (CJS + ESM) の落とし穴
+  - §3.4 `isolatedDeclarations` を入れる判断
+- §4. Performance tuning
+  - §4.1 `incremental` / `composite` / `.tsbuildinfo` の仕組み
+  - §4.2 Watch mode の高速化
+  - §4.3 大規模 monorepo の references グラフ設計
+- §5. Pitfalls deep explanations（症状の裏側の仕組み）
+  - §5.1 Node ESM の拡張子要件はなぜ存在するか
+  - §5.2 `exactOptionalPropertyTypes` で spread が壊れる本当の理由
+  - §5.3 `paths` が runtime で死ぬ仕組み
+  - §5.4 `isolatedModules` が `const enum` を拒む理由
+  - §5.5 `.tsbuildinfo` 由来の幻のエラー
+- §6. Migration strategy（現場運用）
+  - §6.1 PR の粒度と commits 戦略
+  - §6.2 大量エラーへの対処（@ts-expect-error の使い方）
+  - §6.3 段階導入が破綻するサイン
 
 ---
 
-## 2. Module System: Picking the Right Trio
+## §1. Why ESNext + Maximum Strict
 
-`target`, `module`, and `moduleResolution` must agree. Pick one row.
+### tsc を「コードを書き換える人」と扱わず「型検査機」と扱う
 
-| Scenario | `target` | `module` | `moduleResolution` |
-| --- | --- | --- | --- |
-| Browser app via bundler (Vite/webpack/etc.) | `esnext` | `esnext` | `bundler` |
-| Node.js native ESM (`"type": "module"`) | `esnext` | `nodenext` | `nodenext` |
-| Node.js CommonJS (legacy) | `es2022` | `commonjs` | `node` |
-| Dual-package library | `es2020` | `esnext` | `bundler` (build) |
-| Deno / Bun script | `esnext` | `esnext` | `bundler` |
+2018-2020 頃の TypeScript 設定は、`target: "es5"` で polyfill を仕込み、`module: "commonjs"` で出力し、tsc 自身に runtime 互換性を担わせていた。これは bundler が貧弱で、Babel が型を知らず、Node が ESM をサポートしていなかった時代の事情に過ぎない。
 
-**Rule of thumb**: `bundler` is the default for application code. `nodenext` is
-the default for code that runs directly under `node` without a bundler — note
-that `nodenext` requires explicit `.js` extensions in imports
-(`import { x } from "./foo.js"`, even when the source file is `foo.ts`).
+2026 年現在、状況は反転している:
 
----
+- **Bundler は target を別途持つ** (Vite の `build.target`, esbuild の `target`, webpack の `output.environment`)。tsc の `target` と二重で持つと、低い方が事実上の制約になり、tsc 側の `target` を絞っても利益はない（むしろ「現代の構文が使えない」と誤解を生む）。
+- **Babel/SWC/esbuild は型を見ずに transpile する**。tsc に transpile を任せると、ビルド時間が数倍になる上に、何も得しない（型検査と transpile は別仕事）。
+- **Node は ESM をネイティブサポート**。CommonJS で書く理由は legacy 互換だけ。
 
-## 3. Strict Mode: Full Map
+このため、本スキルは「**tsc は `noEmit` で型検査機としてだけ使い、target は ESNext に固定、emit は bundler / Node に任せる**」を原則に置く。library 公開のように tsc 自身が emit する場合だけ、consumer 互換のため `target` を引き下げる。
 
-`"strict": true` is a meta-flag. The individual flags it enables, plus the
-extra strict flags that are *not* part of `strict`, are summarized here.
+### なぜ「最大限」strict なのか
 
-### Included in `strict: true`
+strict 系フラグは **後から有効化すると痛い**。`noUncheckedIndexedAccess` を未有効で 50,000 行書いたコードに後から入れると、何百箇所も `arr[i]!` か guard が必要になる。一方、最初から有効なら、コードを書きながら自然に `if (x !== undefined)` を挟むので、痛みは分散する。
 
-| Flag | Effect |
-| --- | --- |
-| `noImplicitAny` | Disallow values whose type is implicitly `any`. |
-| `strictNullChecks` | `null` and `undefined` are not assignable to other types. |
-| `strictFunctionTypes` | Function parameters checked contravariantly. |
-| `strictBindCallApply` | `bind`/`call`/`apply` are type-checked. |
-| `strictPropertyInitialization` | Class fields must be initialized (or `!`-asserted, or optional). |
-| `noImplicitThis` | `this` of type `any` is rejected. |
-| `useUnknownInCatchVariables` | `catch (e)` infers `e: unknown`. |
-| `alwaysStrict` | Parses in strict mode and emits `"use strict"`. |
-
-### Strongly recommended additions (not in `strict`)
-
-| Flag | Effect |
-| --- | --- |
-| `noUncheckedIndexedAccess` | Index access produces `T \| undefined`. |
-| `exactOptionalPropertyTypes` | `?:` no longer accepts an explicit `undefined`. |
-| `noImplicitOverride` | `override` keyword required for overrides. |
-| `noImplicitReturns` | All code paths in a function must return a value (when one is returned anywhere). |
-| `noFallthroughCasesInSwitch` | Empty non-terminal `case` blocks are an error. |
-| `noUnusedLocals` | Unused locals are an error. |
-| `noUnusedParameters` | Unused parameters are an error (prefix with `_` to opt out). |
-| `allowUnreachableCode: false` | Unreachable code becomes an error, not a warning. |
-| `allowUnusedLabels: false` | Unused labels become an error. |
-
-### Optional but often worth it
-
-| Flag | Effect |
-| --- | --- |
-| `noPropertyAccessFromIndexSignature` | Forces bracket access for index-signature properties. |
-| `verbatimModuleSyntax` | Strict separation of value vs. type imports/exports. |
-| `isolatedDeclarations` | (5.5+) Public APIs must have explicit types so a single file's `.d.ts` can be generated without cross-file inference. |
-| `erasableSyntaxOnly` | (5.8+) Disallow TypeScript-only constructs (`enum`, parameter properties, namespaces) so the source can be type-stripped at runtime. |
-
-### Anti-patterns to avoid
-
-- `"strict": false` in new code — there is no scenario where this is the right
-  default in 2026.
-- Disabling `strictNullChecks` alone — it cascades into widespread bugs.
-- Setting `noUnusedParameters: false` to silence interface implementations —
-  use `_` prefix on the parameter instead, which is the official escape hatch.
+「あとで strict 化する」は実務的に成立しにくい。strict は **新規プロジェクトの段階で固める** のが安い。既存プロジェクトの migration は §6 のように段階導入で抑える。
 
 ---
 
-## 4. File Selection: `include`, `exclude`, `files`
+## §2. Flag-by-flag rationale
 
-| Key | Behavior |
+### §2.1 トリオが独立に決まらない理由
+
+`target` / `module` / `moduleResolution` は、TypeScript の中で **互いに整合性を検査する**。たとえば:
+
+- `module: "commonjs"` を選ぶと、`import` 文は `require()` に変換される。これに対して `moduleResolution: "bundler"` を組み合わせると、bundler 向けの解決（`package.json` の `exports` の `import` 条件を読む等）と CJS の出力が矛盾し、tsc がエラーを出す。
+- `module: "nodenext"` は Node の ESM 仕様（`.js` 必須、`exports` 必須）を厳格にエミュレートする。これと `moduleResolution: "bundler"` を混ぜると、bundler が許す extensionless import を tsc が拒否する。
+
+「アプリは `bundler`、Node ネイティブは `nodenext`」が現実的なルール。前者は bundler が解決方法を決め、後者は Node 自体が決める。中間（`module: "esnext"` + `moduleResolution: "node"`）は、レガシー Node の挙動を真似るだけで、`exports` 等の現代的な package metadata を読めず、デバッグが地獄になる。
+
+### §2.2 `strict: true` が括る 8 フラグの個別解説
+
+| Flag | 何を防ぐか・なぜ重要か |
 | --- | --- |
-| `files` | Exact list. No globs. Highest precedence. |
-| `include` | Globs; defaults to `**/*` when omitted. |
-| `exclude` | Globs; subtracted from `include`. Does **not** affect `files`. |
+| `noImplicitAny` | 暗黙の `any` は型検査の穴。`any` を入れたいなら明示する（`x: any`）。意図しない `any` は大半が「TS が型を推論できなかった = 何かおかしい」のシグナル。 |
+| `strictNullChecks` | これを切ると `null`/`undefined` が任意の型に代入可能になり、型システムが事実上崩壊する。最重要フラグ。 |
+| `strictFunctionTypes` | 関数引数の contravariance を強制。callback の引数を強い型で受けると、弱い型を渡せないようにする。React の event handler などで効く。 |
+| `strictBindCallApply` | `fn.call(this, x, y)` の引数を `fn` のシグネチャと照合。`call`/`apply`/`bind` は型システムの抜け穴になりやすかったが、これで塞がれる。 |
+| `strictPropertyInitialization` | クラスフィールドの初期化忘れを検出。`strictNullChecks` とペアで意味を持つ。`!` (definite assignment assertion) は最後の手段。 |
+| `noImplicitThis` | `function() { this.x }` のような不明な `this` を拒否。arrow function や明示的な `this: Foo` パラメータを書かせる。 |
+| `useUnknownInCatchVariables` | `catch (e)` の `e` を `unknown` 型に。`any` だと `e.message` が無条件で通り、想定外の throw を見逃す。`if (e instanceof Error)` で narrow する習慣を作る。 |
+| `alwaysStrict` | `"use strict"` を全モジュールに付与し、parse 時も strict mode で扱う。`with` や `arguments.callee` などレガシー機能を禁止する。`esnext` を使う限りほぼ自動的に満たされるが、保険として残す。 |
 
-`exclude` defaults to `node_modules`, `bower_components`, `jspm_packages`, and
-the `outDir`. If you set `exclude` explicitly, the defaults are not applied,
-so include `node_modules` again.
+### §2.3 `strict` 外の追加フラグの個別解説
 
-A file imported by an included file is automatically pulled in for type
-checking even if it is outside `include`.
+| Flag | 何を防ぐか・なぜ重要か |
+| --- | --- |
+| `noUncheckedIndexedAccess` | `arr[i]` の型が `T` ではなく `T \| undefined` になる。配列の境界エラーは TypeScript で最も多いランタイム例外の一つで、これだけで激減する。代償は `arr[i]!` や guard を書く必要があること。`Map.get()` などの戻り型と一貫する形になる。 |
+| `exactOptionalPropertyTypes` | `{ x?: number }` の `x` は「キーが無い」または「`number`」のどちらか。`{ x: undefined }` は許されない。これにより `JSON.stringify` の挙動（undefined は key ごと消える）と型が一致する。spread 系で痛い（§5.2）。 |
+| `noImplicitOverride` | 親クラスのメソッドを上書きするとき `override` を必須に。親シグネチャをリネームしたとき、override のはずがオーバーロード扱いで silent に分岐する事故を防ぐ。 |
+| `noImplicitReturns` | どこか一箇所で `return x` するなら、全パスで return する必要がある。`switch` の case で return 漏れがあるバグなどを潰す。 |
+| `noFallthroughCasesInSwitch` | 空でない case が break/return せずに次の case に落ちる場合をエラーに。意図的な fallthrough は `// @ts-expect-error` ではなく `// falls through` コメントで明示する。 |
+| `noUnusedLocals` / `noUnusedParameters` | 未使用変数・引数はエラー。引数だけは interface の都合で使えないことがあるので、`_` プレフィックスで個別 opt-out。グローバル無効化は「使わない引数を消す」という重要なリファクタを止めるので避ける。 |
+| `noUncheckedSideEffectImports` (5.6+) | `import "./foo.js"` で `./foo.js` が存在しなくても TS は默って通していた（副作用 import と解釈）。これでタイポが検出される。 |
 
----
+### §2.4 `verbatimModuleSyntax` / `isolatedModules` がなぜペアで効くか
 
-## 5. Use-Case Templates
-
-### 5.1 Browser app + bundler (Vite, Next.js app code, etc.)
-
-This is the §1 base configuration. Repeated here for convenience.
-
-```json
-{
-  "compilerOptions": {
-    "target": "esnext",
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "lib": ["esnext", "dom", "dom.iterable"],
-    "jsx": "react-jsx",
-    "noEmit": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "resolveJsonModule": true,
-    "allowImportingTsExtensions": true,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true
-  },
-  "include": ["src"]
-}
-```
-
-### 5.2 Node.js ESM application
-
-```json
-{
-  "compilerOptions": {
-    "target": "esnext",
-    "module": "nodenext",
-    "moduleResolution": "nodenext",
-    "lib": ["esnext"],
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true
-  },
-  "include": ["src/**/*"],
-  "exclude": ["**/*.test.ts", "**/*.spec.ts", "dist"]
-}
-```
-
-`package.json` must have `"type": "module"`. Imports must include the `.js`
-extension even though the source file is `.ts`:
+esbuild、SWC、Babel は **ファイル単位** で transpile する。これらは型情報を持たないため、ある import が「型だけ」なのか「値も含む」のか判断できない。たとえば:
 
 ```ts
-import { foo } from "./foo.js"; // resolves ./foo.ts at compile time
+import { Foo } from "./foo";
 ```
 
-### 5.3 Publishable library (separate JS and `.d.ts` output)
+`Foo` が型 alias なら、出力 JS では import 文ごと消すべき。クラスなら残すべき。tsc は型情報からこれを判断できるが、esbuild は判断できない。
 
-```json
-{
-  "compilerOptions": {
-    "target": "esnext",
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "rootDir": "./src",
-    "outDir": "./dist",
-    "declarationDir": "./dist-types",
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "allowImportingTsExtensions": false,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true
-  },
-  "include": ["src/**/*"],
-  "exclude": ["**/*.test.ts", "**/*.spec.ts"]
-}
-```
+`isolatedModules: true` は「ファイル単位で transpile 可能なコードしか書くな」という制約。`verbatimModuleSyntax: true` は「`import type` / `export type` を明示しろ、tsc は import 文を一切書き換えない」という意味。ペアで使うと、esbuild が見たままが tsc の意図と一致する。
 
-Library publishing notes:
+`verbatimModuleSyntax` を切ると、tsc 側で型 import が値 import に化けて、esbuild 側の挙動と齟齬が出る。bundler のあるプロジェクトでは事実上必須。
 
-- For distribution builds, set `allowImportingTsExtensions: false` and remove
-  `.ts` extensions from imports — consumers won't have your `.ts` files.
-- Use `declarationDir` to keep `.d.ts` files separate from `.js` files. This
-  lets bundlers (e.g. tsdown, tsup) emit JS while tsc emits only types.
-- Consider `isolatedDeclarations` (TS 5.5+) so external tools can generate
-  `.d.ts` from a single file without whole-program inference.
+### §2.5 `skipLibCheck` を切ってはいけない実務上の理由
 
-### 5.4 Monorepo with project references
+`skipLibCheck: false` は依存パッケージの `.d.ts` を全て型検査する。問題は、依存ツリーに **壊れた `.d.ts` が一つでもあると、自プロジェクトのビルドが止まる** こと。これは:
 
-Root `tsconfig.json`:
+- 依存パッケージのバグ（公開者がリリース時に型エラーを見逃した）
+- 依存パッケージが古い TS で書かれ、新しい TS で型エラーになる
+- 二つのパッケージが同じ型を別バージョンで定義し、merge で衝突
 
-```json
-{
-  "files": [],
-  "references": [
-    { "path": "./packages/core" },
-    { "path": "./packages/utils" },
-    { "path": "./packages/app" }
-  ]
-}
-```
-
-Each package needs `"composite": true` and a `references` array pointing to
-its dependencies:
-
-```json
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "composite": true,
-    "rootDir": "./src",
-    "outDir": "./dist",
-    "declaration": true,
-    "declarationMap": true
-  },
-  "include": ["src/**/*"],
-  "references": [{ "path": "../core" }]
-}
-```
-
-Build with `tsc --build` (or `tsc -b`). This produces `.tsbuildinfo` files
-that enable incremental rebuilds across the whole workspace.
+のいずれでも起きる。自分のコードの正しさには関係なく、ビルド可否が依存ツリーの状態に揺れる。利得は「依存パッケージの型エラーを検出できる」だが、自プロジェクトが影響を受けるなら issue を上げて修正を待つ方が安全で、ローカルで `skipLibCheck` を切る必要はない。
 
 ---
 
-## 6. `package.json` Companion: Library Exports
+## §3. Library publishing in depth
 
-The `tsconfig.json` is only half the story for libraries. The package must
-declare its entry points so consumers see both the JS and the types.
+ライブラリ公開では `tsconfig.json` だけでは不十分で、`package.json` 側の宣言が consumer の解決を決める。SKILL.md §4.3 のテンプレを書いた上で、`package.json` の `exports` と `files` を以下のように設計する。
+
+### §3.1 conditional exports と `types` の評価順
 
 ```json
 {
   "name": "@your-scope/package-name",
-  "version": "1.0.0",
   "type": "module",
   "exports": {
     ".": {
@@ -336,36 +137,23 @@ declare its entry points so consumers see both the JS and the types.
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./utils": {
-      "types": "./dist-types/utils.d.ts",
-      "import": "./dist/utils.js",
-      "default": "./dist/utils.js"
-    },
     "./package.json": "./package.json"
   },
   "main": "./dist/index.js",
   "types": "./dist-types/index.d.ts",
-  "files": ["dist", "dist-types", "!**/*.test.*", "!**/*.spec.*"],
-  "scripts": {
-    "build": "tsc",
-    "build:watch": "tsc --watch",
-    "clean": "rm -rf dist dist-types",
-    "prepublishOnly": "pnpm run clean && pnpm run build"
-  }
+  "files": ["dist", "dist-types", "!**/*.test.*", "!**/*.spec.*"]
 }
 ```
 
-Key rules for `exports`:
+**最重要ルール: 各 conditional ブロック内で `types` を一番上に置く**。Node / TypeScript / bundler の resolver は条件を上から順にマッチさせ、最初にマッチしたものを採用する。`types` が下にあると、`import` 条件が先にマッチして JS ファイルが返り、型解決が失敗する（または `.d.ts` を「見つからない」扱いになる）。
 
-- `types` **must come first** in each conditional object. Resolvers stop at
-  the first match.
-- Always include `"./package.json": "./package.json"` so tools that read it
-  (linters, bundlers) keep working.
-- Use `main` and top-level `types` as fallbacks for older tooling.
+`"./package.json": "./package.json"` を必ず入れる。ツール（linters, bundlers）が `package.json` を読みに来るので、これが無いと `Module not found` になる。
 
-### Subpath patterns
+top-level の `main` / `types` は exports をサポートしない古いツール（古い webpack、古い Node、古い editor）への fallback。残しておくのが安い。
 
-For multi-entry libraries, glob the entries instead of listing them:
+### §3.2 subpath wildcards
+
+複数エントリポイントを個別に列挙すると保守不能になる。`*` で一括宣言する:
 
 ```json
 {
@@ -390,180 +178,231 @@ For multi-entry libraries, glob the entries instead of listing them:
 }
 ```
 
-The `*` wildcard captures the subpath and reuses it on the target side. The
-files referenced must actually exist after build.
+`*` は consumer 側の subpath をキャプチャし、target 側の対応する `*` に展開する。`@your-scope/pkg/foo` → `./dist/foo.js`、`@your-scope/pkg/components/bar` → `./dist/components/bar.js`。target に対応するファイルが実在しないと、consumer のビルドで `Module not found` になるので、build 出力と一致するパターンを書く。
 
----
+### §3.3 dual-package (CJS + ESM) の落とし穴
 
-## 7. Path Aliases
+CJS と ESM を両方公開する `exports` を書くと、**同じモジュールが二つのインスタンスとしてロードされる**「dual-package hazard」が発生する。たとえば:
 
 ```json
 {
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/*"],
-      "~/*": ["src/*"]
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
     }
   }
 }
 ```
 
-Caveats:
+ある consumer が `require("@pkg")` し、別の consumer が `import "@pkg"` した場合、内部の `singleton` 変数が二つ存在することになる。これは `instanceof` の失敗、状態の二重保持などで実害を出す。
 
-- `paths` only affects type checking. The bundler / runtime needs the same
-  rules configured separately (Vite: `resolve.alias`; webpack: `resolve.alias`;
-  Node: import maps or a loader).
-- With `moduleResolution: "bundler"`, `baseUrl` is no longer required for
-  `paths` to work.
-- Prefer one alias style per project. Mixing `@/` and `~/` is a smell.
+回避策:
 
----
+- ESM-only で公開する（最も安全、依存元が CJS なら issue を上げる）
+- `package.json` の `sideEffects: false` を設定し、純関数だけにする
+- internal state を持つモジュールは必ず ESM のみで公開
 
-## 8. Performance Tuning
+新規パッケージは **ESM-only** が推奨。CJS consumer は `import()` で動的 import するか、ESM への移行を促す。
 
-| Option | Effect |
-| --- | --- |
-| `incremental: true` | Emit `.tsbuildinfo` for fast subsequent type-checks. |
-| `composite: true` | Required for project references; implies `incremental`. |
-| `tsBuildInfoFile` | Custom location for `.tsbuildinfo` (default: alongside output). |
-| `skipLibCheck: true` | Skip `.d.ts` inside dependencies. Almost always on. |
-| `assumeChangesOnlyAffectDirectDependencies` | (Watch mode) only re-check direct dependents. Faster but less safe. |
+### §3.4 `isolatedDeclarations` を入れる判断
 
-For large projects:
-
-1. Enable `skipLibCheck`.
-2. Use project references to split the build graph.
-3. Run `tsc --noEmit --incremental` in CI to cache type-check results.
-4. Keep `include` narrow; don't `include: ["**/*"]` from the repo root.
-
-Diagnostic commands:
-
-```sh
-tsc --showConfig          # print the fully resolved config (after extends)
-tsc --traceResolution     # log every module resolution step
-tsc --extendedDiagnostics # detailed phase timings
-tsc --listFiles           # list every file in the program
-```
-
----
-
-## 9. Sharing Configuration with `extends`
-
-Place common settings in `tsconfig.base.json` at the repo root:
-
-```json
-{
-  "compilerOptions": {
-    "target": "esnext",
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true
-  }
-}
-```
-
-Then in each package:
-
-```json
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "outDir": "./dist", "rootDir": "./src" },
-  "include": ["src"]
-}
-```
-
-`extends` accepts an array (TS 5.0+) for layered presets:
-
-```json
-{ "extends": ["@tsconfig/strictest/tsconfig", "./tsconfig.base.json"] }
-```
-
-Notable community presets on npm:
-
-- `@tsconfig/strictest` — every reasonable strict flag turned on.
-- `@tsconfig/node20`, `@tsconfig/node22` — runtime-targeted defaults.
-- `@tsconfig/recommended` — minimal modern baseline.
-
----
-
-## 10. Common Pitfalls
-
-**Mixed module / resolution settings.** `module: "commonjs"` with
-`moduleResolution: "bundler"` is invalid; the resolver expects matching ESM
-output. Use the table in §2.
-
-**`paths` works in tsc but breaks at runtime.** TypeScript only rewrites
-imports if `module` is CommonJS *and* it's emitting. With `noEmit: true`,
-`paths` is a type-only hint; configure the bundler too.
-
-**`enum` and `const enum` under `isolatedModules`.** `const enum` is rejected
-because per-file transpilers can't inline its values. Use a `const` object
-with `as const` instead.
-
-**`verbatimModuleSyntax` rejects mixed imports.** Split them:
+`isolatedDeclarations: true` (TS 5.5+) は、**ファイル単位で `.d.ts` が生成できるよう、public API に明示的な型注釈を要求する** フラグ。具体的には:
 
 ```ts
-// Wrong
-import { foo, type Bar } from "./mod"; // OK actually — syntax is fine
-import Foo, { type Bar } from "./mod"; // also OK
+// NG: 戻り型を推論
+export function foo() { return bar(); }
 
-// Wrong: implicit type-only re-export
-export { Bar } from "./mod"; // error if Bar is type-only
-export type { Bar } from "./mod"; // correct
+// OK
+export function foo(): string { return bar(); }
 ```
 
-**`exactOptionalPropertyTypes` breaks spread patterns.** Code like
-`{ ...defaults, x: maybeUndefined }` no longer satisfies `{ x?: number }`
-because the property is now present-with-undefined. Either omit the key or
-widen the type to `{ x?: number | undefined }`.
+これは tsc 以外の `.d.ts` 生成ツール（`tsdown`, `oxc`, `swc` の `dts` プラグイン等）が **whole-program inference 無しで** 型宣言ファイルを作れるようにするため。tsc 自身は whole-program で見るので不要だが、ビルドツールに JS 出力と型宣言を別系統で作らせる場合に意味がある。
 
-**Stale `.tsbuildinfo`.** When changing `compilerOptions`, delete cached
-`.tsbuildinfo` files; tsc does not always invalidate them automatically.
+判断:
 
-**`skipLibCheck: false` in a polyglot dependency tree.** A single broken
-`.d.ts` file in `node_modules` blocks the whole build. Keep `skipLibCheck`
-on unless you have a specific reason.
+- tsc だけで build しているなら **不要**（メリットなし、コストだけ）
+- `tsdown` / `swc` で JS を、tsc で型を出す構成なら **入れて良い**（型ツールの選択肢が広がる）
+- API 注釈の明示が読み手にも有益なので、純粋に design discipline として入れるのもアリ
 
 ---
 
-## 11. Migration Cheatsheet (Loose → Strict)
+## §4. Performance tuning
 
-For an existing codebase, enable flags in this order to minimize churn:
+大規模プロジェクト（>100k LOC, monorepo）で tsc が遅いと感じたら、以下の順で対処する。
 
-1. `strict: true` — fix `null`/`undefined` and implicit `any`.
-2. `noUnusedLocals` + `noUnusedParameters` — easy wins.
-3. `noImplicitReturns` + `noFallthroughCasesInSwitch` — control-flow checks.
-4. `noUncheckedIndexedAccess` — many sites, mostly `arr[i]!` or guards.
-5. `exactOptionalPropertyTypes` — last; touches API shapes.
-6. `verbatimModuleSyntax` — also touches every import file.
+### §4.1 `incremental` / `composite` / `.tsbuildinfo` の仕組み
 
-Run `tsc --noEmit` after each step. Commit between steps.
+`incremental: true` を有効にすると、tsc は型検査結果のキャッシュを `.tsbuildinfo` ファイルに書き出す。次回実行時、変更されていないファイルの型検査をスキップする。デフォルトでは `outDir` の隣（`outDir` が無ければ `tsconfig.json` の隣）に置かれる。
+
+`composite: true` は `incremental` を含意し、project references の前提条件でもある。composite な project は他の project から `references` で参照可能になる。
+
+`tsBuildInfoFile` で `.tsbuildinfo` の場所を明示できる:
+
+```json
+{ "tsBuildInfoFile": "./node_modules/.cache/tsbuildinfo" }
+```
+
+これは CI で artifact をキャッシュする場合に便利。
+
+注意: `compilerOptions` を変更したとき、tsc は `.tsbuildinfo` の互換性を完全には判定できない。変更後にエラーが残るときは `.tsbuildinfo` を削除して再実行する（§5.5 参照）。
+
+### §4.2 Watch mode の高速化
+
+`tsc --watch` の応答性を上げるには:
+
+- `assumeChangesOnlyAffectDirectDependencies: true` で、変更ファイルの直接依存先だけを再検査する（推移的に追わない）。速いが、間接的な型壊しを見逃す可能性あり。
+- `disableSourceOfProjectReferenceRedirect: true` で project references の解決を簡略化する（限定的なシナリオで有効）。
+
+editor の TS server も同じ仕組みで動くので、これらは IDE 体感にも効く。
+
+### §4.3 大規模 monorepo の references グラフ設計
+
+`references` のグラフ設計の指針:
+
+- **leaf package（依存されないが依存する側）** を増やしすぎない。一つのアプリパッケージから 20 個の lib を参照すると、`tsc --build` のスケジューリングが重くなる。
+- **共通基盤を `tsconfig.base.json` で `extends`**、依存関係は `references` で表現するという二層構造を保つ。両者を混ぜると保守が破綻する。
+- **CI では `tsc --build --verbose`** で実際のビルド順を確認し、想定外の依存があれば即修正する。
+
+CI 観点では、`tsc --noEmit --incremental` を `.tsbuildinfo` を artifact キャッシュとして使うと、PR 間でキャッシュが効き、CI 時間が劇的に縮む。
 
 ---
 
-## 12. Quick Decision Tree
+## §5. Pitfalls deep explanations
 
+SKILL.md §6 の症状表に対応する「裏側の仕組み」をここに残す。
+
+### §5.1 Node ESM の拡張子要件はなぜ存在するか
+
+Node ESM 仕様は **extensionless import を許さない**。これは「`./foo` が `./foo.js` か `./foo/index.js` か `./foo.ts` かを Node に判定させない」設計判断で、ES Module の仕様（仕様上拡張子の暗黙補完は無し）に従う。
+
+TypeScript ソースファイルは `.ts` だが、Node の実行時は `.js` 拡張子で書く必要がある。これは「ソースは `.ts`、実行時の解決は `.js` を見る」という暗黙の規約。TS 5.7 の `--rewriteRelativeImportExtensions` は、ソースで `.ts` を書いて出力で `.js` に書き換えてくれる。これにより:
+
+```ts
+// Source (TS 5.7+ with rewriteRelativeImportExtensions)
+import { x } from "./foo.ts";
+
+// Output JS
+import { x } from "./foo.js";
 ```
-Building an app?
-├── Browser via bundler        → §5.1  (esnext + bundler + noEmit)
-├── Node.js ESM                → §5.2  (esnext + nodenext)
-└── Node.js CJS (legacy)       → adapt §5.2 with module/moduleResolution = node
-Building a library?
-├── Single package             → §5.3  (declaration + declarationMap)
-└── Monorepo                   → §5.4  (project references + composite)
-Need fast incremental builds?  → §8    (incremental, references, skipLibCheck)
-Need to share config?          → §9    (extends, presets)
+
+IDE での go-to-definition が `.ts` のまま動くので体験が良い。Node 22.6+ の `--experimental-strip-types` と組み合わせるとさらに強力（tsc が transpile せず、Node が type を剥ぐだけで動く）。
+
+### §5.2 `exactOptionalPropertyTypes` で spread が壊れる本当の理由
+
+```ts
+type Opts = { x?: number };
+const defaults: Opts = {};
+const incoming: { x?: number | undefined } = { x: undefined };
+
+const merged: Opts = { ...defaults, ...incoming };  // ERROR
 ```
+
+`{ x?: number }` は **「`x` キーが無い」または「`number`」** という意味。`{ x: undefined }` は「`x` キーが存在し、値が `undefined`」なので、両者は別の型。
+
+spread は object literal の代入なので、`incoming` の `x: undefined` がそのまま `merged` に入る → `merged.x` が present-with-undefined → `Opts` を満たさない、というロジック。
+
+回避策:
+
+1. キーを条件付きで含める: `const merged = { ...defaults, ...(incoming.x !== undefined ? { x: incoming.x } : {}) }`
+2. 型を広げる: `type Opts = { x?: number | undefined }`（`undefined` 明示）
+3. spread ではなく明示的なフィールド代入
+
+3 が最も安全。spread は「型を見ずに rest が一致する」ことを期待する書き方で、`exactOptionalPropertyTypes` と本質的に相性が悪い。
+
+### §5.3 `paths` が runtime で死ぬ仕組み
+
+`paths` は tsc の型検査時のモジュール解決マップ。`tsc --emit` （古典的なビルド）では、tsc が出力 JS の `import` を書き換えて alias を解決する… **ことはない**。tsc は `paths` を「型検査だけのヒント」として扱い、emit 時には変換しない。
+
+これは仕様。理由は「runtime の解決方法（bundler / Node / Deno）が tsc から独立しているべき」という設計判断。runtime に届くと `import { x } from "@/components/Foo"` のまま残り、Node や bundler が `@/components/Foo` を理解できずに `Module not found` になる。
+
+正しい対処:
+
+- Vite / webpack: `resolve.alias` に同じ alias を設定
+- Node ESM: `package.json` の `imports` (subpath imports) や `--import` loader
+- bundler を通さず tsc emit する場合: `tsc-alias` のような post-processor を使う（推奨しない、bundler を使うべき）
+
+### §5.4 `isolatedModules` が `const enum` を拒む理由
+
+`const enum` は、TypeScript が **コンパイル時に値をインライン化** する機能。
+
+```ts
+// Source
+const enum Color { Red = 1, Blue = 2 }
+const c = Color.Red;
+
+// tsc emit (with const enum inlining)
+const c = 1 /* Color.Red */;
+```
+
+これは tsc が **全プログラムを見て** 初めて可能。`isolatedModules` 環境（esbuild / SWC）はファイル単位で transpile するので、`Color` の定義を見ずに `Color.Red` を翻訳できない。
+
+回避: 通常の `enum` を使うか、`as const` オブジェクトに置換する:
+
+```ts
+const Color = { Red: 1, Blue: 2 } as const;
+type Color = (typeof Color)[keyof typeof Color];
+```
+
+後者が現代的。`enum` 自体も `erasableSyntaxOnly` (TS 5.8+) では禁止されるので、`as const` の方が将来安全。
+
+### §5.5 `.tsbuildinfo` 由来の幻のエラー
+
+`incremental` を有効にすると `.tsbuildinfo` がキャッシュを保持する。問題は、tsc は `compilerOptions` の変更が cached state に与える影響を **完全には追跡しない** こと。特に:
+
+- `lib` の変更
+- `paths` の追加
+- `references` のグラフ変更
+
+これらの後にエラーが「変な場所に残る」「変更したはずなのにキャッシュされた古いエラーが出る」と感じたら、`.tsbuildinfo` を削除して `tsc --build --force` で再生成する。
+
+monorepo では各 package の `.tsbuildinfo` を全削除する必要がある場合がある:
+
+```sh
+find . -name "*.tsbuildinfo" -delete
+```
+
+---
+
+## §6. Migration strategy
+
+SKILL.md §8 の migration order（strict 段階導入）を、現場運用の観点で補足する。
+
+### §6.1 PR の粒度と commits 戦略
+
+各 strict flag の有効化は **独立した PR** にする。理由:
+
+- 一つの flag を入れたときのエラー量が読める（10 か 1000 かで対応戦略が変わる）
+- PR レビュアーが「何が変わったか」を理解できる（flag の意味と差分が一対一）
+- 問題が出たら revert しやすい
+
+PR 内の commits は:
+
+1. `flag を有効化する commit`（tsconfig 変更のみ、テストは fail）
+2. `errors を解消する commit`（または複数 commit、機械的修正と意味のある修正を分ける）
+
+「機械的修正」と「意味のある修正」を混ぜない。前者は `_` プレフィックス追加、`!` non-null assertion、`as` cast など、レビュアーが流し読みできるもの。後者は実際にコードを変える修正で、設計判断が入る。
+
+### §6.2 大量エラーへの対処
+
+`noUncheckedIndexedAccess` を有効化すると、既存コードに数百のエラーが出ることがある。一気に直さず:
+
+```ts
+// migration 中の暫定対処
+// @ts-expect-error TODO(strict-migration): noUncheckedIndexedAccess
+const x = arr[i];
+```
+
+`@ts-expect-error` で **コメント付き** マークしておけば、後から `grep TODO(strict-migration)` で全箇所を集約できる。`@ts-ignore` は使わない（コメントが消えても気付かない）。`@ts-expect-error` は対象エラーが消えると逆にエラーになる。
+
+各 PR で 50-100 件ずつ修正していくのが現実的。
+
+### §6.3 段階導入が破綻するサイン
+
+以下のいずれかが見えたら、migration を一時停止して全体を見直す:
+
+- 一つの PR で 500 行以上の `!` / `as` が並ぶ → そもそもの API 設計が strict と合っていない可能性。型を見直す
+- 同じ箇所を二回直している → migration 順序が悪い（後の flag が前の flag の修正を要求している）
+- ランタイムバグが migration 期間に増えた → `!` で抑えた箇所が実際に undefined だった。`!` を guard に置き換える
+
+段階導入は「型を整える」だけで「runtime を変える」べきではない。runtime バグが出るなら、migration の判定が間違っている。
